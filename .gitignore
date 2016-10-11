@@ -1,1 +1,7 @@
 twitterconfig.json
+*.log
+etc/config.json
+static/bootstrap/*
+static/fa/*
+static/js/bootstrap-collapse.js
+static/js/bootstrap-tab.js
