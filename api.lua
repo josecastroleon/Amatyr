@@ -181,6 +181,17 @@ function record(match)
         ORDER BY dayrain DESC
         LIMIT 1
         ]]
+    elseif key == 'dayrain' and func == 'MIN' then
+        -- Not valid with any other value than min
+        sql = [[
+        SELECT
+        DISTINCT date_trunc('day', datetime) AS datetime,
+        MIN(rain) OVER (PARTITION BY date_trunc('day', datetime)) AS dayrain
+        FROM ]]..conf.db.table..[[
+        ]]..where..[[
+        ORDER BY dayrain DESC
+        LIMIT 1
+        ]]
     elseif func == 'SUM' then
         -- The SUM part doesn't need the datetime of the record since the datetime is effectively over the whole scope
         sql = [[
