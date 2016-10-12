@@ -76,7 +76,7 @@ function max(match)
 			date_trunc('day', datetime) AS datetime,
 			MAX(]]..key..[[) AS ]]..key..[[
 		FROM ]]..conf.db.table..[[
-		WHERE date_part('year', datetime) < 2013
+		WHERE date_part('year', datetime) > ]]..conf.firstyear..[[
 		GROUP BY 1
 	]]
 
