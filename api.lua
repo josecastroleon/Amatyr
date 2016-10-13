@@ -9,7 +9,7 @@ local ngx = ngx
 local string = string
 local cjson = require "cjson"
 local io = require "io"
-local pg = require "resty.postgres" -- https://github.com/azurewang/lua-resty-postgres
+local pg = require "resty.mysql"
 local assert = assert
 local conf
 
@@ -26,17 +26,17 @@ if not conf then
 end
 
 local function dbreq(sql)
-    local db = pg:new()
+    local db = mysql:new()
     db:set_timeout(30000)
     local ok, err = db:connect(
         {
             host=conf.db.host,
-            port=5432,
+            port = 3306,
             database=conf.db.database,
             user=conf.db.user,
-            password=conf.db.password,
-            compact=false
-        })
+            password=conf.db.password
+        }
+    )
     if not ok then
         ngx.say(err)
     end
@@ -48,15 +48,6 @@ local function dbreq(sql)
     end
     db:set_keepalive(0,10)
     return cjson.encode(res)
-end
-
--- The function sending subreq to nginx postgresql location with rds_json on
--- returns json body to the caller
-local function odbreq(sql)
-    --ngx.log(ngx.ERR, 'SQL: ' .. sql)
-    local dbreq = ngx.location.capture("/pg", { args = { sql = sql } })
-    local json = dbreq.body
-    return json
 end
 
 -- Translate front end column names to back end column names
@@ -71,22 +62,20 @@ function max(match)
     local keytest = ngx.re.match(key, '[a-z]+', 'oj')
     if not keytest then ngx.exit(403) end
 
-    local sql = [[
+    return dbreq([[
 		SELECT
 			date_trunc('day', datetime) AS datetime,
 			MAX(]]..key..[[) AS ]]..key..[[
 		FROM ]]..conf.db.table..[[
-		WHERE date_part('year', datetime) > ]]..conf.firstyear..[[
+		WHERE YEAR(datetime) >= ]]..conf.firstyear..[[
 		GROUP BY 1
-	]]
-
-    return dbreq(sql)
+	]])
 end
 
 -- Latest record in db
 function now(match)
-    return dbreq([[SELECT
-    *,
+    return dbreq([[
+    SELECT *,
     (
         SELECT SUM(rain)
         FROM ]]..conf.db.table..[[
@@ -94,17 +83,23 @@ function now(match)
     )
     AS dayrain
     FROM ]]..conf.db.table..[[
-    ORDER BY datetime DESC LIMIT 1]])
+    ORDER BY datetime DESC LIMIT 1
+    ]])
 end
 
 -- Last 60 samples from db
 function recent(match)
-    return dbreq([[SELECT
-    *,
-    SUM(rain) OVER (PARTITION by datetime ORDER by datetime DESC) AS dayrain
-    FROM ]]..conf.db.table..[[
-    ORDER BY datetime DESC
-    LIMIT 60]])
+    return dbreq([[
+    SELECT *, b.dayrain
+    FROM ]]..conf.db.table..[[ AS a
+    INNER JOIN (
+	    SELECT datetime, SUM(rain) AS dayrain
+	    FROM ]]..conf.db.table..[[
+	    GROUP BY datetime
+	    ORDER BY datetime DESC
+    ) AS b ON a.datetime = b.datetime
+    LIMIT 60
+    ]])
 end
 
 -- Helper function to get a start argument and return SQL constrains
@@ -173,23 +168,29 @@ function record(match)
     if key == 'dayrain' and func == 'MAX' then
         -- Not valid with any other value than max
         sql = [[
-        SELECT
-        DISTINCT date_trunc('day', datetime) AS datetime,
-        SUM(rain) OVER (PARTITION BY date_trunc('day', datetime)) AS dayrain
-        FROM ]]..conf.db.table..[[
+        SELECT DISTINCT date_trunc('day', a.datetime) AS datetime, b.dayrain
+        FROM ]]..conf.db.table..[[ AS a
+        INNER JOIN (
+	        SELECT datetime, SUM(rain) AS dayrain
+	        FROM ]]..conf.db.table..[[
+	        GROUP BY date_trunc('day', datetime)
+        ) AS b ON a.datetime = b.datetime
         ]]..where..[[
-        ORDER BY dayrain DESC
+        ORDER BY b.dayrain DESC
         LIMIT 1
         ]]
     elseif key == 'dayrain' and func == 'MIN' then
         -- Not valid with any other value than min
         sql = [[
-        SELECT
-        DISTINCT date_trunc('day', datetime) AS datetime,
-        MIN(rain) OVER (PARTITION BY date_trunc('day', datetime)) AS dayrain
-        FROM ]]..conf.db.table..[[
+        SELECT DISTINCT date_trunc('day', a.datetime) AS datetime, b.dayrain
+        FROM ]]..conf.db.table..[[ AS a
+        INNER JOIN (
+	        SELECT datetime, MIN(rain) AS dayrain
+	        FROM ]]..conf.db.table..[[
+	        GROUP BY date_trunc('day', datetime)
+        ) AS b ON a.datetime = b.datetime
         ]]..where..[[
-        ORDER BY dayrain DESC
+        ORDER BY b.dayrain DESC
         LIMIT 1
         ]]
     elseif func == 'SUM' then
@@ -204,7 +205,9 @@ function record(match)
         sql = [[
         SELECT
             datetime,
-			date_trunc('second', age(NOW(), date_trunc('second', datetime))) AS age,
+            date_trunc('second', CONCAT(TIMESTAMPDIFF( YEAR, NOW(), date_trunc('second', datetime) ),' Years,',
+                                        TIMESTAMPDIFF( MONTH, NOW(), date_trunc('second', datetime) ) % 12,' Months,',
+                                        FLOOR( TIMESTAMPDIFF( DAY, NOW(), date_trunc('second', datetime) ) % 30.4375 ),' Days')) AS age
             ]]..key..[[
         FROM ]]..conf.db.table..[[
         WHERE
@@ -238,7 +241,7 @@ function by_dateunit(match)
     local where, andwhere = getDateConstrains(ngx.req.get_uri_args()['start'])
     local sql = dbreq([[
     SELECT
-        date_trunc(']]..unit..[[', datetime) AS datetime,
+        date_trunc(]]..unit..[[, a.datetime) AS datetime,
         AVG(outtemp) as outtemp,
         MIN(outtemp) as tempmin,
         MAX(outtemp) as tempmax,
@@ -254,15 +257,12 @@ function by_dateunit(match)
         AVG(inhumidity) as inhumidity,
         AVG(heatindex) as heatindex,
         AVG(windchill) as windchill
-    FROM ]]..conf.db.table..[[ as a
-    LEFT OUTER JOIN (
-        SELECT DISTINCT
-            date_trunc(']]..unit..[[', datetime) AS unit,
-            SUM(rain) OVER (PARTITION BY date_trunc('day', datetime) ORDER by datetime) AS dayrain
-        FROM ]]..conf.db.table..[[ ]]..where..[[
-        ORDER BY 1
-    ) AS b
-    ON a.datetime = b.unit
+    FROM ]]..conf.db.table..[[ AS a
+    INNER JOIN (
+        SELECT datetime, SUM(rain) AS dayrain
+        FROM ]]..conf.db.table..[[
+        GROUP BY date_trunc(]]..unit..[[, datetime)
+    ) AS b ON a.datetime = b.datetime
     ]]..where..[[
     GROUP BY 1
     ORDER BY datetime
@@ -272,11 +272,15 @@ end
 
 function day(match)
     local where, andwhere = getDateConstrains(ngx.req.get_uri_args()['start'])
+
     local sql = dbreq([[
-    SELECT
-        *,
-        SUM(rain) OVER (ORDER by datetime) AS dayrain
-    FROM ]]..conf.db.table..[[
+    SELECT *, b.dayrain
+    FROM ]]..conf.db.table..[[ AS a
+    INNER JOIN (
+	    SELECT datetime, SUM(rain) AS dayrain
+	    FROM ]]..conf.db.table..[[
+	    ORDER BY datetime
+    ) AS b ON a.datetime = b.datetime
     ]]..where..[[
     ORDER BY datetime
     ]])
@@ -317,7 +321,7 @@ function year(match)
         local gendays = dbreq([[
         CREATE TABLE days AS
             SELECT
-                date_trunc('day', datetime) AS datetime,
+                date_trunc('day', a.datetime) AS datetime,
                 AVG(outtemp) as outtemp,
                 MIN(outtemp) as tempmin,
                 MAX(outtemp) as tempmax,
@@ -334,14 +338,11 @@ function year(match)
                 AVG(heatindex) as heatindex,
                 AVG(windchill) as windchill
             FROM ]]..conf.db.table..[[ AS a
-            LEFT OUTER JOIN
-            (
-                SELECT
-                    DISTINCT date_trunc('day', datetime) AS hour,
-                    SUM(rain) OVER (PARTITION BY date_trunc('day', datetime) ORDER by datetime) AS dayrain
-                    FROM ]]..conf.db.table..[[ ORDER BY 1
-            ) AS b
-            ON a.datetime = b.hour
+            INNER JOIN (
+                SELECT datetime, SUM(rain) AS dayrain
+                FROM ]]..conf.db.table..[[
+                GROUP BY date_trunc('day', datetime)
+            ) AS b ON a.datetime = b.datetime
             GROUP BY 1
             ORDER BY datetime
             ]])
